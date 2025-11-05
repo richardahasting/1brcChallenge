@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 memmap2 = "0.9"
 rayon = "1.10"
+ahash = "0.8"
 
 [profile.release]
 opt-level = 3

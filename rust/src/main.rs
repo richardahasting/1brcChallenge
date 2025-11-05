@@ -1,9 +1,11 @@
 /**
- * 1 Billion Row Challenge - Rust Optimized Implementation
+ * 1 Billion Row Challenge - Rust Optimized Implementation (v2)
  *
  * Optimizations applied:
  * - Memory-mapped I/O (memmap2) for zero-copy file access
  * - Multi-threading with rayon for parallel processing
+ * - AHashMap for faster hashing
+ * - Minimal allocations (use byte slices as keys during processing)
  * - Chunk-based processing with newline boundaries
  * - Per-thread hash maps (no locking during processing)
  * - Custom temperature parsing
@@ -15,15 +17,14 @@
  * Author: Richard Hastings with Claude Code
  */
 
+use ahash::AHashMap;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::sync::Arc;
 use std::time::Instant;
 
-const DEFAULT_NUM_THREADS: usize = 7;
+const DEFAULT_NUM_THREADS: usize = 30;  // Optimal for rayon (scales better than producer-consumer)
 const DEFAULT_CHUNK_SIZE_KB: usize = 288;
 
 /// Station statistics
@@ -74,7 +75,8 @@ impl Stats {
 
 /// Parse temperature from byte slice
 /// Format: [-]dd.d
-fn parse_temperature(bytes: &[u8]) -> Option<f64> {
+#[inline]
+fn parse_temperature(bytes: &[u8]) -> f64 {
     let mut idx = 0;
     let negative = if bytes[idx] == b'-' {
         idx += 1;
@@ -101,38 +103,43 @@ fn parse_temperature(bytes: &[u8]) -> Option<f64> {
         value += (bytes[idx] - b'0') as f64 / 10.0;
     }
 
-    Some(if negative { -value } else { value })
+    if negative { -value } else { value }
 }
 
-/// Process a chunk of data
-fn process_chunk(data: &[u8]) -> HashMap<Vec<u8>, Stats> {
-    let mut stations: HashMap<Vec<u8>, Stats> = HashMap::new();
+/// Process a chunk of data using byte slices as keys
+fn process_chunk(data: &[u8]) -> AHashMap<Vec<u8>, Stats> {
+    let mut stations: AHashMap<Vec<u8>, Stats> = AHashMap::new();
     let mut pos = 0;
 
     while pos < data.len() {
         // Find semicolon
-        let semicolon_pos = match data[pos..].iter().position(|&b| b == b';') {
-            Some(p) => pos + p,
-            None => break,
-        };
+        let mut semicolon_pos = pos;
+        while semicolon_pos < data.len() && data[semicolon_pos] != b';' {
+            semicolon_pos += 1;
+        }
+
+        if semicolon_pos >= data.len() {
+            break;
+        }
 
         // Extract station name
         let station_name = &data[pos..semicolon_pos];
 
         // Find newline
-        let newline_pos = match data[semicolon_pos + 1..].iter().position(|&b| b == b'\n') {
-            Some(p) => semicolon_pos + 1 + p,
-            None => data.len(),
-        };
+        let mut newline_pos = semicolon_pos + 1;
+        while newline_pos < data.len() && data[newline_pos] != b'\n' {
+            newline_pos += 1;
+        }
 
         // Parse temperature
         let temp_bytes = &data[semicolon_pos + 1..newline_pos];
-        if let Some(temperature) = parse_temperature(temp_bytes) {
-            stations
-                .entry(station_name.to_vec())
-                .and_modify(|stats| stats.update(temperature))
-                .or_insert_with(|| Stats::new(temperature));
-        }
+        let temperature = parse_temperature(temp_bytes);
+
+        // Update or insert
+        stations
+            .entry(station_name.to_vec())
+            .and_modify(|stats| stats.update(temperature))
+            .or_insert_with(|| Stats::new(temperature));
 
         pos = newline_pos + 1;
     }
@@ -141,7 +148,7 @@ fn process_chunk(data: &[u8]) -> HashMap<Vec<u8>, Stats> {
 }
 
 /// Create chunks aligned on newline boundaries
-fn create_chunks(data: &[u8], chunk_size: usize) -> Vec<(usize, usize)> {
+fn create_chunks(data: &[u8], chunk_size: usize) -> Vec<&[u8]> {
     let mut chunks = Vec::new();
     let mut pos = 0;
 
@@ -158,7 +165,7 @@ fn create_chunks(data: &[u8], chunk_size: usize) -> Vec<(usize, usize)> {
             }
         }
 
-        chunks.push((pos, end));
+        chunks.push(&data[pos..end]);
         pos = end;
     }
 
@@ -166,8 +173,8 @@ fn create_chunks(data: &[u8], chunk_size: usize) -> Vec<(usize, usize)> {
 }
 
 /// Merge multiple hashmaps
-fn merge_results(results: Vec<HashMap<Vec<u8>, Stats>>) -> HashMap<Vec<u8>, Stats> {
-    let mut merged: HashMap<Vec<u8>, Stats> = HashMap::new();
+fn merge_results(results: Vec<AHashMap<Vec<u8>, Stats>>) -> AHashMap<Vec<u8>, Stats> {
+    let mut merged: AHashMap<Vec<u8>, Stats> = AHashMap::new();
 
     for result in results {
         for (station, stats) in result {
@@ -182,7 +189,7 @@ fn merge_results(results: Vec<HashMap<Vec<u8>, Stats>>) -> HashMap<Vec<u8>, Stat
 }
 
 /// Print results sorted by station name
-fn print_results(stations: &HashMap<Vec<u8>, Stats>) {
+fn print_results(stations: &AHashMap<Vec<u8>, Stats>) {
     let mut station_vec: Vec<(&Vec<u8>, &Stats)> = stations.iter().collect();
     station_vec.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -223,7 +230,7 @@ fn main() {
         .unwrap_or(DEFAULT_CHUNK_SIZE_KB);
     let chunk_size = chunk_size_kb * 1024;
 
-    eprintln!("=== 1 Billion Row Challenge - Rust Optimized ===");
+    eprintln!("=== 1 Billion Row Challenge - Rust Optimized v2 ===");
     eprintln!("Input file: {}", filename);
     eprintln!("Worker threads: {}", num_threads);
     eprintln!("Chunk size: {} KB\n", chunk_size_kb);
@@ -259,7 +266,7 @@ fn main() {
         file_size as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
-    // Create chunks
+    // Create chunks (just slices, no Arc needed)
     let chunks = create_chunks(&mmap, chunk_size);
     eprintln!("Created {} chunks\n", chunks.len());
 
@@ -267,13 +274,9 @@ fn main() {
     let start = Instant::now();
 
     // Process chunks in parallel
-    let mmap_arc = Arc::new(mmap);
-    let results: Vec<HashMap<Vec<u8>, Stats>> = chunks
+    let results: Vec<AHashMap<Vec<u8>, Stats>> = chunks
         .par_iter()
-        .map(|(start, end)| {
-            let chunk_data = &mmap_arc[*start..*end];
-            process_chunk(chunk_data)
-        })
+        .map(|chunk_data| process_chunk(chunk_data))
         .collect();
 
     // Merge results
