@@ -1,0 +1,37 @@
+# Data files
+data/
+*.txt
+measurements*.txt
+
+# Java
+*.class
+*.jar
+
+# C
+*.o
+*.out
+onebrc
+a.out
+
+# Rust
+target/
+*.pdb
+onebrc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Benchmarking results
+results/
+*.log
