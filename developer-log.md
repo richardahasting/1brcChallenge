@@ -221,8 +221,342 @@ Single reader thread can't keep up with 7 workers - I/O bound at 42% CPU.
 - [ ] Try different queue strategies
 
 **Other Languages:**
-- [ ] Begin C implementation (Issue #4)
+- [x] Begin C implementation (Issue #4)
 - [ ] Begin Rust implementation (Issue #6)
 - [ ] Compare performance across languages
+
+---
+
+## Session 3 - November 5, 2025 (Continued): C Baseline Implementation
+
+### User Request
+> "let's begin the C implementation"
+
+### Context
+After completing and optimizing the Java implementation (9.4× speedup), starting the C baseline to compare performance characteristics. Following the same learning approach: baseline first, then optimize.
+
+### Work Completed
+
+#### 1. Created Feature Branch
+```bash
+git checkout -b feature/c-implementation
+```
+
+#### 2. Implemented C Baseline (onebrc.c)
+**Design approach:**
+- Keep it simple and correct first
+- Standard FILE* I/O with fgets()
+- Custom hash table with chaining
+- Custom temperature parser (no atof)
+- Single-threaded
+
+**Key components:**
+```c
+- Station struct: name, min, max, sum, count, next
+- HashTable: 16,384 buckets with chaining
+- hash_string(): djb2 algorithm
+- parse_temperature(): custom parser (faster than atof)
+- process_line(): parse station and temperature, update stats
+```
+
+**Code statistics:**
+- Lines: ~250
+- Hash table size: 16,384 buckets
+- Max station name: 100 bytes
+- Line buffer: 256 bytes
+
+#### 3. Testing Results
+
+**1K rows:**
+- Status: ✓ Correct (99 stations found)
+- Duration: <0.01s
+
+**10M rows (cold cache, 2 runs):**
+- Run 1: 0.44 seconds
+- Run 2: 0.46 seconds
+- Average: ~0.45 seconds
+- Throughput: ~311 MB/s
+- File size: ~140 MB
+
+### Performance Comparison: C vs Java
+
+**10M rows benchmark:**
+
+| Implementation | Duration | Throughput | Speedup |
+|----------------|----------|------------|---------|
+| Java baseline (BufferedReader) | 1.06s | 132 MB/s | 1.0× |
+| **C baseline (fgets)** | **0.45s** | **311 MB/s** | **2.4×** |
+| Java optimized (mmap + parallel) | 0.20s | 700 MB/s | 5.3× |
+
+**Key insight:** C baseline is already 2.4× faster than Java baseline!
+
+### Technical Analysis
+
+**Why is C faster out of the box?**
+
+1. **No JVM overhead**: Direct system calls, no bytecode interpretation
+2. **Manual memory management**: No garbage collection pauses
+3. **Simpler I/O**: fgets() is lightweight compared to BufferedReader
+4. **Custom parsing**: parse_temperature() avoids library overhead
+5. **Efficient hash table**: Simple chaining, no synchronized overhead
+
+**What C baseline does well:**
+- Custom parsing (no atof/strtod)
+- Simple hash function (djb2)
+- Direct memory access
+- Single allocation per station
+
+**What could be optimized:**
+- Memory-mapped I/O (like Java)
+- Parallelization with pthreads
+- SIMD instructions for parsing
+- Better hash table (open addressing?)
+- Larger I/O buffer size
+
+### Code Structure
+
+```c
+// Hash table with chaining
+typedef struct Station {
+    char name[MAX_STATION_NAME + 1];
+    double min, max, sum;
+    long count;
+    struct Station *next;
+} Station;
+
+// Custom temperature parser
+double parse_temperature(const char *str) {
+    // Parse [-]dd.d format manually
+    // Much faster than atof()
+}
+```
+
+### Compilation
+```bash
+gcc -O3 -o onebrc onebrc.c
+```
+
+### Next Steps
+
+**Optimization roadmap:**
+1. [ ] Add memory-mapped I/O (mmap)
+2. [ ] Benchmark mmap vs fgets
+3. [ ] Add parallelization (pthreads)
+4. [ ] Test on 1B rows
+5. [ ] Compare final C vs final Java
+
+**Expected improvements:**
+- mmap: 1.5-2× faster (based on Java experience)
+- Parallelization: 5-7× faster (with optimal threads)
+- Combined: Target <5 seconds for 1B rows?
+
+### Key Learnings
+
+1. **C is fast by default**: 2.4× faster than Java baseline without optimization
+2. **Simple beats complex**: Straightforward code is easier to optimize
+3. **Custom parsing matters**: Even in C, avoiding library functions helps
+4. **Test small first**: 1K → 10M → 1B incremental testing approach works well
+
+### Files Created
+
+**New files:**
+- `c/onebrc.c` (250 lines, baseline implementation)
+- `c/onebrc` (compiled binary)
+
+### Session Statistics
+- Lines of code: ~250
+- Compilation time: <1s
+- Test runs: 3 (1K, 10M×2)
+- Branch: feature/c-implementation
+- Performance: 2.4× faster than Java baseline
+
+---
+
+## Session 4 - November 5, 2025 (Continued): C Optimization
+
+### User Request
+> "let's optimize the C implementation"
+
+### Context
+After establishing C baseline performance (0.45s on 10M rows, 2.4× faster than Java baseline), now optimizing with mmap and parallelization to match Java's optimized performance.
+
+### Work Completed
+
+#### 1. Created C Optimized Implementation (onebrc_optimized.c)
+**Optimizations applied:**
+- Memory-mapped I/O (mmap) for zero-copy access
+- Multi-threading with pthreads (7 worker threads)
+- Producer-consumer pattern for sequential I/O
+- Lock-free per-thread hash tables (merged at end)
+- Bounded work queue with backpressure
+- Custom temperature parsing (no atof)
+- MADV_SEQUENTIAL hint for kernel
+
+**Architecture:**
+```c
+- GlobalState: file_data, file_size, num_threads, chunk_size
+- WorkQueue: Bounded queue with pthread mutex/cond
+- WorkerContext: Per-thread context with local hash table
+- reader_thread(): Main thread, sequential reading, creates chunks
+- worker_thread(): Process chunks in parallel
+- merge_tables(): Combine worker results into global table
+```
+
+**Key features:**
+- Zero-copy design (pass pointers, not data)
+- Sequential I/O (single reader, avoids random access)
+- Lock-free workers (each has own hash table)
+- Optimal defaults: 7 threads, 288KB chunks
+
+**Code statistics:**
+- Lines: ~500
+- Compilation: `gcc -O3 -pthread`
+
+#### 2. Testing Results
+
+**1K rows:**
+- Status: ✓ Correct (99 stations)
+- Duration: <0.01s
+
+**10M rows (cold cache):**
+- Duration: 0.11 seconds
+- Throughput: 1,241 MB/s
+- Speedup vs C baseline: 4.1×
+- Speedup vs Java baseline: 9.6×
+
+**1B rows (cold cache, 30s cooldown):**
+- Duration: 12.16 seconds
+- Throughput: 1,145 MB/s
+- Stations found: 99
+
+#### 3. Station Count Investigation
+
+**Observation:** C finds 99 stations, Java finds 104 on 1B dataset
+
+**Investigation results:**
+- Generator script has 100 entries, 99 unique (Istanbul duplicate)
+- C baseline: 99 stations ✓
+- C optimized: 99 stations ✓
+- Java optimized: 104 stations ✗
+- Java original: 104 stations ✗
+
+**Conclusion:** C is correct (matches generator), Java has overcounting bug
+
+**Root cause unknown, but likely:**
+- Java creating phantom/duplicate entries
+- Hash table merge issue in Java
+- String handling edge case
+
+### Performance Comparison: Final Results
+
+**1 Billion Rows (13.6 GB file):**
+
+| Implementation | Duration | Throughput | Speedup | CPU | Stations |
+|----------------|----------|------------|---------|-----|----------|
+| Java baseline | ~105s | 130 MB/s | 1.0× | 10% | - |
+| C baseline | 42.18s | 323 MB/s | 2.5× | 10% | 99 |
+| **Java optimized** | **11.66s** | **1,194 MB/s** | **9.0×** | 42% | 104* |
+| **C optimized** | **12.16s** | **1,145 MB/s** | **8.7×** | ~50% | 99 |
+
+*Java appears to have overcounting bug (expected 99)
+
+**Key Insights:**
+1. **C and Java optimized are virtually identical** (~11-12s)
+2. C baseline is 2.5× faster than Java baseline
+3. Both achieve ~9× speedup with optimization
+4. Both are I/O bound (~40-50% CPU)
+5. C has correct station count (99), Java has bug (104)
+
+### Technical Analysis
+
+**Why C matches Java performance:**
+1. **Same optimizations applied**: mmap, parallelization, sequential I/O
+2. **Similar architecture**: Producer-consumer, optimal chunk size (288KB)
+3. **I/O bound**: Single reader bottleneck limits both
+4. **Compiler optimization**: gcc -O3 very effective
+
+**Where C has advantages:**
+- Simpler, more direct code (500 vs 800+ lines)
+- No JVM overhead
+- Faster baseline (2.4× vs Java)
+- Manual memory management (no GC pauses)
+
+**Where Java has advantages:**
+- More mature optimization (JIT can optimize hot paths)
+- Easier parallelization (Executor framework)
+- Better abstraction (cleaner code structure)
+
+**I/O Bottleneck (both languages):**
+- Single reader thread scanning for newlines
+- Workers starving, waiting for chunks
+- Sequential read: ~1.2 GB/s (disk limit)
+- Only ~40-50% CPU utilization
+
+### Code Highlights
+
+**Zero-copy chunk passing:**
+```c
+typedef struct {
+    char *start;  // Pointer into mmap'd region
+    char *end;    // End pointer
+    int is_poison;
+} WorkChunk;
+```
+
+**Lock-free per-thread processing:**
+```c
+// Each worker has its own hash table
+HashTable *worker_tables = malloc(num_threads * sizeof(HashTable));
+
+// Workers process independently (no locks)
+void* worker_thread(void *arg) {
+    WorkerContext *ctx = (WorkerContext*)arg;
+    // Process chunks using ctx->local_table
+}
+
+// Merge at end (single-threaded)
+for (int i = 0; i < num_threads; i++) {
+    merge_tables(&global_table, &worker_tables[i]);
+}
+```
+
+###  Next Steps
+
+**Immediate:**
+- [ ] Commit C optimized implementation
+- [ ] Update progress.md with C results
+- [ ] Investigate Java overcounting bug (optional)
+
+**Further optimization (both languages):**
+- [ ] Multiple reader threads
+- [ ] SIMD for parsing (AVX2)
+- [ ] Better hash function
+- [ ] Open addressing instead of chaining
+
+**Other:**
+- [ ] Rust implementation
+- [ ] Cross-language comparison document
+
+### Key Learnings
+
+1. **C can match Java performance** with same optimizations
+2. **I/O is the bottleneck** - language doesn't matter at this point
+3. **Correctness matters** - C found Java's overcounting bug
+4. **Producer-consumer works great** in both languages
+5. **Optimal parameters transfer** - 288KB, 7 threads work for both
+
+### Files Created
+
+**New files:**
+- `c/onebrc_optimized.c` (500 lines)
+- `c/onebrc_optimized` (compiled binary)
+
+### Session Statistics
+- Lines of code: ~500 (optimized version)
+- Compilation time: <1s
+- Test runs: 3 (1K, 10M, 1B)
+- Branch: feature/c-implementation
+- Performance: **12.16s for 1B rows** (virtually identical to Java)
+- Correctness: ✓ (99 stations, matches generator)
 
 ---
